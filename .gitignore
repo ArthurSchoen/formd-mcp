@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 data/formd_all.sqlite
+*.log
+data/*.sqlite
