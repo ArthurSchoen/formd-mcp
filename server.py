@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from datetime import date
 
@@ -28,12 +29,6 @@ def check_date(texte, nom):
         date.fromisoformat(texte)
     except ValueError:
         raise ToolError(f"{nom} doit être au format AAAA-MM-JJ, reçu : {texte!r}")
-
-
-@mcp.tool
-def ping():
-    "Vérifie que le serveur Form D répond."
-    return "pong"
 
 
 @mcp.tool
@@ -99,6 +94,94 @@ def search_form_d(industries: list[str] | None = None,
     rows = [dict(r) for r in con.execute(sql, params)]
     con.close()
     return rows
+
+
+MAX_CANDIDATES = 10
+
+
+@mcp.tool
+def find_issuer(name: str, include_funds: bool = False) -> list[dict]:
+    """Cherche une société par son nom dans les dépôts Form D, sans tenir compte des majuscules.
+
+    La recherche porte sur le nom légal actuel et sur les anciens noms. L'outil ne devine
+    jamais : il renvoie jusqu'à 10 candidats, un par société (CIK), avec le nom légal le plus
+    récent, l'État, le nombre de dépôts et la date du dernier dépôt. Le choix revient au
+    modèle ou à l'utilisateur.
+
+    Le nom légal diffère souvent de la marque (la marque Facebook correspond au nom légal
+    Meta Platforms, Inc.). Si aucun candidat n'est la société voulue et que son nom légal
+    est connu, relancer la recherche avec ce nom.
+
+    include_funds : False par défaut. Un véhicule nommé d'après une société
+    (« X Capital Fund, LP ») n'est pas cette société ; True pour inclure les fonds.
+
+    Une liste vide veut dire qu'aucun dépôt ne correspond, pas que la société n'a pas levé :
+    une levée sans Form D est fréquente.
+    """
+    sql = "SELECT * FROM filings WHERE (entity_name LIKE ? OR previous_names LIKE ?)"
+    if not include_funds:
+        sql += " AND is_fund = 0"
+    pattern = f"%{name}%"
+    con = connect()
+    rows = con.execute(sql, (pattern, pattern)).fetchall()
+    con.close()
+
+    # LIKE cherche une sous-chaîne : « anthropic » trouverait « Philanthropic ».
+    # On ne garde que les noms où la recherche commence un mot.
+    word = re.compile(r"\b" + re.escape(name), re.IGNORECASE)
+    companies = {}
+    for r in rows:
+        if not word.search(f"{r['entity_name']} | {r['previous_names'] or ''}"):
+            continue
+        c = companies.setdefault(r["cik"], {"n_filings": 0, "last": r})
+        c["n_filings"] += 1
+        if r["filing_date"] > c["last"]["filing_date"]:
+            c["last"] = r
+
+    candidates = [
+        {
+            "entity_name": c["last"]["entity_name"],
+            "cik": cik,
+            "state_inc": c["last"]["state_inc"],
+            "previous_names": c["last"]["previous_names"],
+            "n_filings": c["n_filings"],
+            "last_filing_date": c["last"]["filing_date"],
+        }
+        for cik, c in companies.items()
+    ]
+    candidates.sort(key=lambda c: c["last_filing_date"], reverse=True)
+    return candidates[:MAX_CANDIDATES]
+
+
+@mcp.tool
+def company_history(cik: str) -> dict:
+    """Renvoie tout l'historique Form D d'une société, du dépôt le plus ancien au plus récent.
+
+    cik : identifiant SEC de la société, donné par find_issuer (les zéros en tête sont
+    facultatifs : 2023314 et 0002023314 sont équivalents).
+
+    Pour chaque dépôt : filing_date, type (D pour un nouveau dépôt, D/A pour un amendement
+    qui corrige ou met à jour un dépôt précédent), amount_sold en dollars, n_investors,
+    industry, is_fund (1 si le dépôt est celui d'un fonds), accession.
+    people : noms et rôles des personnes déclarées sur le dépôt le plus récent.
+    """
+    cik = cik.strip().zfill(10)
+    con = connect()
+    filings = [dict(r) for r in con.execute(
+        "SELECT filing_date, CASE is_amendment WHEN 1 THEN 'D/A' ELSE 'D' END AS type, "
+        "amount_sold, n_investors, industry, is_fund, accession, entity_name "
+        "FROM filings WHERE cik = ? ORDER BY filing_date, accession", (cik,))]
+    if not filings:
+        con.close()
+        raise ToolError(f"Aucun dépôt pour le CIK {cik}. Utiliser find_issuer pour trouver le CIK à partir d'un nom.")
+    latest = filings[-1]
+    entity_name = latest["entity_name"]
+    people = [dict(r) for r in con.execute(
+        "SELECT first_name, last_name, roles FROM people WHERE accession = ?", (latest["accession"],))]
+    con.close()
+    for f in filings:
+        del f["entity_name"]
+    return {"entity_name": entity_name, "cik": cik, "filings": filings, "people": people}
 
 
 if __name__ == "__main__":
